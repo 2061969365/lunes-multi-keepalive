@@ -23,7 +23,6 @@ jobs:
           git config --local user.email "github-actions[bot]@users.noreply.github.com"
           git config --local user.name "github-actions[bot]"
           
-          # 确保目录存在
           mkdir -p .github
           echo "Last active: $(date)" > .github/keep-alive.txt
           
@@ -34,9 +33,9 @@ jobs:
           else
             git commit -m "chore: github actions keep alive [skip ci]"
             
-            # 【进化核心】拉取远程最新变动并变基，彻底避免并发推送冲突
-            git pull --rebase origin ${ { github.ref_name } }
+            # 拉取远程最新变动并变基，彻底避免并发推送冲突
+            git pull --rebase origin ${{ github.ref_name }}
             
             # 推送到当前分支
-            git push origin HEAD:${ { github.ref } }
+            git push origin HEAD:${{ github.ref }}
           fi
