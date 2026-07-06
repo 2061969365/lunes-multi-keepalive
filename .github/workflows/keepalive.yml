@@ -1,23 +1,42 @@
-name: Keep Actions Alive
+name: GitHub Actions Keep Alive (Bulletproof)
 
 on:
   schedule:
-    # 每 30 天跑一次，防止 GitHub 因 60 天无活动自动禁用 Actions
-    - cron: '0 0 1 * *'
-    - cron: '0 0 15 * *'
-  workflow_dispatch:
+    # 避开整点（00:00）的拥堵时段，改在凌晨 3:17 分触发，能大幅降低 GitHub 节点的延迟
+    - cron: '17 3 */3 * *'
+  workflow_dispatch: 
 
 jobs:
-  keepalive:
+  keep-alive:
     runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
+    permissions:
+      contents: write
 
-      - name: Touch to keep alive
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Auto Commit to Keep Alive
         run: |
-          echo "Last keepalive: $(date -u)" > .keepalive
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add .keepalive
-          git diff --cached --quiet || git commit -m "chore: keepalive $(date -u +%Y-%m-%d)"
-          git push
+          git config --local user.email "github-actions[bot]@users.noreply.github.com"
+          git config --local user.name "github-actions[bot]"
+          
+          # 确保目录存在
+          mkdir -p .github
+          echo "Last active: $(date)" > .github/keep-alive.txt
+          
+          git add .github/keep-alive.txt
+          
+          if git diff --staged --quiet; then
+            echo "No changes detected."
+          else
+            git commit -m "chore: github actions keep alive [skip ci]"
+            
+            # 【进化核心】拉取远程最新变动并变基，彻底避免并发推送冲突
+            git pull --rebase origin ${ { github.ref_name } }
+            
+            # 推送到当前分支
+            git push origin HEAD:${ { github.ref } }
+          fi
