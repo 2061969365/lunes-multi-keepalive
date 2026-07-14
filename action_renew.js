@@ -298,6 +298,11 @@ async function processAccount(page, user) {
         console.error(`[${label}] 异常:`, err.message);
         try { await page.screenshot({ path: ssPath, fullPage: true }); } catch (e) { }
         return { success: false, screenshot: ssPath, user: user.username, error: err.message };
+    } finally {
+        if (!page.isClosed()) {
+            await page.context().clearCookies();
+            console.log(`[${label}] Cookies 已清除`);
+        }
     }
 }
 
