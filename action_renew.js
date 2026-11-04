@@ -19,6 +19,8 @@ const HTTP_PROXY = process.env.LUNES_PROXY || process.env.HTTP_PROXY;
 const DEBUG_PORT = 9222;
 const PHOTO_DIR = path.join(process.cwd(), 'screenshots');
 const DEFAULT_PROXY = 'socks5://127.0.0.1:40000';
+const VIEWPORT_WIDTH = 1280;
+const VIEWPORT_HEIGHT = 900;
 
 function sleep(ms) {
     return new Promise(resolve => setTimeout(resolve, ms));
@@ -92,6 +94,15 @@ async function sendTelegramMessage(message, imagePath = null) {
 const TURNSTILE_HOOK = `
 (function() {
     if (window.self === window.top) return;
+    try {
+        function getRandomInt(min, max) {
+            return Math.floor(Math.random() * (max - min + 1)) + min;
+        }
+        const screenX = getRandomInt(800, 1200);
+        const screenY = getRandomInt(400, 600);
+        Object.defineProperty(MouseEvent.prototype, 'screenX', { value: screenX });
+        Object.defineProperty(MouseEvent.prototype, 'screenY', { value: screenY });
+    } catch (e) { }
     const roots = [];
     window.__lunesTurnstileRoots = roots;
     function describe(root) {
@@ -158,6 +169,29 @@ function checkPort(port) {
             resolve(false);
         });
     });
+}
+
+async function configurePageViewport(page) {
+    try {
+        await page.setViewportSize({ width: VIEWPORT_WIDTH, height: VIEWPORT_HEIGHT });
+        console.log(`[视口] 已设置为 ${VIEWPORT_WIDTH}x${VIEWPORT_HEIGHT}`);
+        return;
+    } catch (e) {
+        console.log('[视口] page.setViewportSize 失败:', e.message);
+    }
+    try {
+        const client = await page.context().newCDPSession(page);
+        await client.send('Emulation.setDeviceMetricsOverride', {
+            width: VIEWPORT_WIDTH,
+            height: VIEWPORT_HEIGHT,
+            deviceScaleFactor: 1,
+            mobile: false
+        });
+        await client.detach().catch(() => { });
+        console.log(`[视口] 已通过 CDP 设置为 ${VIEWPORT_WIDTH}x${VIEWPORT_HEIGHT}`);
+    } catch (e) {
+        console.log('[视口] CDP 设置失败:', e.message);
+    }
 }
 
 async function launchChrome(proxy) {
@@ -257,6 +291,19 @@ async function waitForTurnstileToken(page, timeoutMs) {
     return null;
 }
 
+async function hasTurnstileFrame(page) {
+    try {
+        // Turnstile iframe 可能挂在 closed shadow DOM 里，DOM locator 找不到，
+        // 直接用 page.frames() 判断更可靠。
+        return page.frames().some(frame => {
+            const url = frame.url();
+            return url.includes('challenges.cloudflare.com') || url.includes('turnstile');
+        });
+    } catch (e) {
+        return false;
+    }
+}
+
 async function findTurnstileWidget(page) {
     for (const frame of page.frames()) {
         if (!frame.url().includes('challenges.cloudflare.com')) continue;
@@ -327,18 +374,40 @@ async function clickTurnstileWidget(page, client, target) {
 }
 
 async function solveTurnstile(page) {
-    let token = await getTurnstileToken(page);
-    if (token) {
-        console.log('   >> Turnstile 已有 token');
-        return token;
-    }
+    for (let pageAttempt = 1; pageAttempt <= 2; pageAttempt++) {
+        let token = await getTurnstileToken(page);
+        if (token) {
+            console.log('   >> Turnstile 已有 token');
+            return token;
+        }
 
-    const client = await page.context().newCDPSession(page);
-    try {
-        // Turnstile 脚本加载较慢，先最多等 30 秒让复选框出现
+        // 等待 Turnstile iframe 出现（最多 15 秒）
+        let sawTurnstile = false;
+        const loadDeadline = Date.now() + 15000;
+        while (Date.now() < loadDeadline) {
+            token = await getTurnstileToken(page);
+            if (token) {
+                console.log(`   >> Turnstile 验证通过 (token 长度 ${token.length})`);
+                return token;
+            }
+            if (await hasTurnstileFrame(page)) {
+                sawTurnstile = true;
+                break;
+            }
+            await sleep(1000);
+        }
+
+        if (!sawTurnstile) {
+            console.log(`   >> 第 ${pageAttempt} 次加载未检测到 Turnstile，刷新重试...`);
+            await page.reload({ waitUntil: 'domcontentloaded', timeout: 60000 }).catch(() => { });
+            await page.waitForTimeout(3000);
+            continue;
+        }
+
+        // 等待复选框出现（最多 10 秒；卡在 Verifying 时刷新）
         let target = null;
-        const deadline = Date.now() + 30000;
-        while (Date.now() < deadline) {
+        const widgetDeadline = Date.now() + 10000;
+        while (Date.now() < widgetDeadline) {
             token = await getTurnstileToken(page);
             if (token) {
                 console.log(`   >> Turnstile 验证通过 (token 长度 ${token.length})`);
@@ -350,37 +419,54 @@ async function solveTurnstile(page) {
         }
 
         if (!target) {
-            console.log('   >> 30 秒内未出现 Turnstile 复选框');
-            console.log('   >> 当前 frames:', page.frames().map(f => f.url().slice(0, 120)).join(' | '));
-            token = await waitForTurnstileToken(page, 5000);
-            if (token) console.log(`   >> Turnstile 验证通过 (token 长度 ${token.length})`);
-            return token;
+            console.log(`   >> 第 ${pageAttempt} 次 Turnstile 卡在验证中，刷新重试...`);
+            await page.reload({ waitUntil: 'domcontentloaded', timeout: 60000 }).catch(() => { });
+            await page.waitForTimeout(3000);
+            continue;
         }
 
-        for (let attempt = 1; attempt <= 2; attempt++) {
-            console.log(`   >> 第 ${attempt} 次点击 Turnstile 复选框...`);
-            if (await clickTurnstileWidget(page, client, target)) {
-                token = await waitForTurnstileToken(page, 20000);
-                if (token) {
-                    console.log(`   >> Turnstile 验证通过 (token 长度 ${token.length})`);
-                    return token;
-                }
+        // 参考 dump 仓库：最多点击 10 次，每次等待 5 秒
+        for (let attempt = 1; attempt <= 10; attempt++) {
+            token = await getTurnstileToken(page);
+            if (token) {
+                console.log(`   >> Turnstile 验证通过 (token 长度 ${token.length})`);
+                return token;
+            }
+
+            console.log(`   >> 第 ${attempt}/10 次点击 Turnstile 复选框...`);
+            const client = await page.context().newCDPSession(page);
+            try {
+                await clickTurnstileWidget(page, client, target);
+            } finally {
+                await client.detach().catch(() => { });
+            }
+            await page.waitForTimeout(5000);
+
+            token = await getTurnstileToken(page);
+            if (token) {
+                console.log(`   >> Turnstile 验证通过 (token 长度 ${token.length})`);
+                return token;
             }
 
             target = await findTurnstileWidget(page);
             if (!target) {
-                token = await waitForTurnstileToken(page, 5000);
+                console.log('   >> 复选框消失，等待自动验证...');
+                token = await getTurnstileToken(page);
                 if (token) {
                     console.log(`   >> Turnstile 验证通过 (token 长度 ${token.length})`);
                     return token;
                 }
                 break;
             }
-            await sleep(2000 + Math.random() * 1000);
+            console.log('   >> 点击后验证未通过，继续重试...');
         }
-    } finally {
-        await client.detach().catch(() => { });
+
+        console.log(`   >> 第 ${pageAttempt} 次 Turnstile 未通过，刷新重试...`);
+        await page.reload({ waitUntil: 'domcontentloaded', timeout: 60000 }).catch(() => { });
+        await page.waitForTimeout(3000);
     }
+
+    console.log('   >> 检测到 Turnstile，但未能通过验证');
     return null;
 }
 
@@ -395,18 +481,18 @@ async function loginOnce(page, user, label) {
         return { success: true, alreadyLoggedIn: true };
     }
 
+    console.log(`[${label}] 检测 Turnstile...`);
+    const token = await solveTurnstile(page);
+    if (!token) {
+        return { success: false, retryable: true, error: 'Turnstile not solved' };
+    }
+
     console.log(`[${label}] 填充表单...`);
     const emailInput = page.locator('input[type="email"]').first();
     await emailInput.waitFor({ state: 'visible', timeout: 20000 });
     await emailInput.fill(user.username);
     await page.locator('input[type="password"]').first().fill(user.password);
     await page.waitForTimeout(500);
-
-    console.log(`[${label}] 检测 Turnstile...`);
-    const token = await solveTurnstile(page);
-    if (!token) {
-        return { success: false, retryable: true, error: 'Turnstile not solved' };
-    }
 
     const submitButton = page.locator('button[type="submit"]').first();
     await submitButton.waitFor({ state: 'visible', timeout: 15000 });
@@ -460,6 +546,7 @@ async function processAccount(context, user) {
     const ssPath = path.join(PHOTO_DIR, `${label}.png`);
     const page = await context.newPage();
     page.setDefaultTimeout(60000);
+    await configurePageViewport(page);
     await page.addInitScript(TURNSTILE_HOOK);
 
     try {
