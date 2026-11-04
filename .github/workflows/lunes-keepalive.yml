@@ -7,9 +7,14 @@ on:
     - cron: '30 8 * * *'
   workflow_dispatch:
 
+concurrency:
+  group: lunes-keepalive
+  cancel-in-progress: false
+
 jobs:
   keepalive:
     runs-on: ubuntu-latest
+    timeout-minutes: 20
 
     steps:
       - uses: actions/checkout@v4
@@ -25,6 +30,14 @@ jobs:
           sudo apt-get install -y xvfb
           npm install
           npx playwright install-deps chrome
+
+      - name: Ensure Chrome
+        run: |
+          if ! command -v google-chrome >/dev/null 2>&1 && ! command -v google-chrome-stable >/dev/null 2>&1; then
+            echo "google-chrome not found, installing via Playwright..."
+            npx playwright install chrome
+          fi
+          google-chrome --version 2>/dev/null || google-chrome-stable --version 2>/dev/null || chromium --version
 
       - name: Set up WARP
         uses: fscarmen/warp-on-actions@v1.4
@@ -52,15 +65,17 @@ jobs:
           curl --connect-timeout 5 https://ifconfig.me || echo "❌ 网络异常"
 
           echo "=== 6. 代理诊断 ==="
-          curl -I --connect-timeout 5 --socks5-hostname 127.0.0.1:40000 https://cloudflare.com/cdn-cgi/trace || echo "❌ WARP 代理异常"
+          curl -sS --connect-timeout 5 --socks5-hostname 127.0.0.1:40000 https://cloudflare.com/cdn-cgi/trace || echo "❌ WARP 代理异常"
 
       - name: Run Renew Script
         env:
           USERS_JSON: ${{ secrets.USERS_JSON }}
           LUNES_SERVER_URL: ${{ secrets.LUNES_SERVER_URL }}
+          LUNES_PROXY: ${{ secrets.LUNES_PROXY }}
+          LUNES_LOGIN_URL: ${{ secrets.LUNES_LOGIN_URL }}
           TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
           TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
-        run: xvfb-run --auto-servernum --server-args="-screen 0 1280x720x24" node action_renew.js
+        run: xvfb-run --auto-servernum --server-args="-screen 0 1280x1024x24" node action_renew.js
 
       - name: Upload Screenshots
         if: always()
